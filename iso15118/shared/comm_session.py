@@ -451,7 +451,18 @@ class V2GCommunicationSession(SessionStateMachine):
                 # The biggest message is the Certificate Installation Response,
                 # which is estimated to be maximum between 5k to 6k
                 # TODO check if that still holds with -20 (e.g. cross certs)
-                message = await asyncio.wait_for(self.reader.read(7000), timeout)
+                #message = await asyncio.wait_for(self.reader.read(7000), timeout)
+                ResvHeader = await asyncio.wait_for(self.reader.readexactly(8), timeout)
+                ResvHeaderHex = bytearray(ResvHeader).hex()
+                # print("00 ResvHeader=", ResvHeader.encode('utf-8'))
+                print("11 ResvHeader=", ResvHeader)
+                exiDataLen = int(ResvHeaderHex[8:], 16)
+                print("22 exiDataLen=", exiDataLen)
+                ResvExiData = await asyncio.wait_for(self.reader.readexactly(exiDataLen), timeout)
+                print("33 ResvExiData=", ResvExiData)
+                # print("44 ResvExiData=", ResvHeader.encode('utf-8'))
+                message = ResvHeader + ResvExiData
+                print("55 message.len=", len(message))
                 if message == b"" and self.reader.at_eof():
                     stop_reason: str = "TCP peer closed connection"
                     await self.stop(reason=stop_reason)
