@@ -7,7 +7,7 @@ SessionStopRes.
 import asyncio
 import logging
 from time import time
-from typing import Any, List, Union, Optional, Tuple, Type
+from typing import Any, List, Union
 
 from iso15118.evcc import evcc_settings
 from iso15118.evcc.comm_session_handler import EVCCCommunicationSession
@@ -36,15 +36,12 @@ from iso15118.shared.messages.enums import (
     Protocol,
 )
 from iso15118.shared.messages.iso15118_2.body import (
-    EMAID,
     AuthorizationReq,
     AuthorizationRes,
     CableCheckReq,
     CableCheckRes,
     CertificateInstallationReq,
     CertificateInstallationRes,
-    CertificateUpdateReq,
-    CertificateUpdateRes,
     ChargeParameterDiscoveryReq,
     ChargeParameterDiscoveryRes,
     ChargingStatusReq,
@@ -80,8 +77,6 @@ from iso15118.shared.messages.iso15118_2.datatypes import (
     ServiceCategory,
     ServiceID,
     eMAID,
-    CertificateChain,
-    SubCertificates,
 )
 from iso15118.shared.messages.iso15118_2.msgdef import V2GMessage as V2GMessageV2
 from iso15118.shared.messages.iso15118_2.timeouts import Timeouts
@@ -90,7 +85,6 @@ from iso15118.shared.messages.iso15118_20.common_types import (
 )
 from iso15118.shared.messages.timeouts import Timeouts as TimeoutsShared
 from iso15118.shared.messages.xmldsig import X509IssuerSerial
-from iso15118.shared.messages.xmldsig import Signature
 from iso15118.shared.notifications import StopNotification
 from iso15118.shared.security import (
     CertPath,
@@ -108,7 +102,6 @@ from iso15118.shared.security import (
     verify_signature,
 )
 from iso15118.shared.states import Terminate
-
 
 logger = logging.getLogger(__name__)
 
@@ -467,27 +460,10 @@ class PaymentServiceSelection(StateEVCC):
                         f"CertificateInstallationReq: {exc}"
                     )
                     return
-            elif await self.comm_session.ev_controller.is_cert_update_needed():
-                
-                try:
-                    (cert_update_req, signature) = self.generate_certificate_update_req()
-                    self.create_next_message(
-                        CertificateUpdate,
-                        cert_update_req,
-                        Timeouts.CERTIFICATE_UPDATE_REQ,
-                        Namespace.ISO_V2_MSG_DEF,
-                        signature=signature,
-                    )
-                except PrivateKeyReadError as exc:
-                    self.stop_state_machine(
-                        "Can't read private key necessary to sign "
-                        f"CertificateInstallationReq: {exc}"
-                    )
-                    return
             else:
                 try:
                     payment_details_req = PaymentDetailsReq(
-                        emaid=get_cert_cn(load_cert(CertPath.CONTRACT_LEAF_DER)),
+                        emaid=eMAID(get_cert_cn(load_cert(CertPath.CONTRACT_LEAF_DER))),
                         cert_chain=load_cert_chain(
                             protocol=Protocol.ISO_15118_2,
                             leaf_path=CertPath.CONTRACT_LEAF_DER,
@@ -512,72 +488,7 @@ class PaymentServiceSelection(StateEVCC):
                 Timeouts.AUTHORIZATION_REQ,
                 Namespace.ISO_V2_MSG_DEF,
             )
-    # 组装证书更新请求
-    def generate_certificate_update_req(
-        self,
-    ) -> Tuple[CertificateUpdateReq, Signature]:
-        # Here we create the CertificateUpdateReq message ourselves as we
-        # have access to all certificates and private keys needed.
-        # This is however not the real production case.
-        # Note: the Raw EXI encoded message that includes the Header and the Body of the
-        # CertificateUpdateReq must be used.
-        
 
-        # The elements that need to be part of the signature
-        contract_cert_chain = CertificateChain(
-            id="id1",
-            certificate=load_cert(CertPath.CONTRACT_LEAF_DER),
-            sub_certificates=SubCertificates(
-                certificates=[
-                    load_cert(CertPath.MO_SUB_CA2_DER),
-                    load_cert(CertPath.MO_SUB_CA1_DER),
-                ]
-            ),
-        )
-        # The eMAID of the contract, string
-        emaid = get_cert_cn(load_cert(CertPath.CONTRACT_LEAF_DER))
-
-        issuer, serial = get_cert_issuer_serial(CertPath.V2G_ROOT_DER)
-        list_of_root_cert_ids = RootCertificateIDList(
-            x509_issuer_serials=[
-                X509IssuerSerial(
-                    x509_issuer_name=issuer, x509_serial_number=serial
-                )
-            ]
-        )
-
-        cert_update_req = CertificateUpdateReq(
-            id="id1",
-            contract_cert_chain = contract_cert_chain,
-            emaid = emaid,
-            list_of_root_cert_ids = list_of_root_cert_ids
-        )
-
-        try:
-            elements_to_sign = [
-                (
-                    cert_update_req.id,
-                    EXI().to_exi(
-                        cert_update_req, Namespace.ISO_V2_MSG_DEF
-                    ),
-                )
-            ]
-            # The contract private key to be used for the signature
-            signature_key = load_priv_key(
-                KeyPath.CONTRACT_LEAF_PEM,
-                KeyEncoding.PEM,
-                KeyPasswordPath.CONTRACT_LEAF_KEY_PASSWORD,
-            )
-
-            signature = create_signature(elements_to_sign, signature_key)
-
-        except PrivateKeyReadError as exc:
-            raise PrivateKeyReadError(
-                "Can't read private key needed to create signature "
-                f"for CertificateUpdateReq: {exc}",
-            )
-
-        return cert_update_req, signature
 
 class CertificateInstallation(StateEVCC):
     """
@@ -668,10 +579,9 @@ class CertificateInstallation(StateEVCC):
                 f"CertificateInstallationRes. {exc}"
             )
             return
-        emaid = get_cert_cn(load_cert(CertPath.CONTRACT_LEAF_DER))
-        
+
         payment_details_req = PaymentDetailsReq(
-            emaid=emaid,
+            emaid=get_cert_cn(load_cert(CertPath.CONTRACT_LEAF_DER)),
             cert_chain=load_cert_chain(
                 protocol=Protocol.ISO_15118_2,
                 leaf_path=CertPath.CONTRACT_LEAF_DER,
@@ -687,116 +597,6 @@ class CertificateInstallation(StateEVCC):
             Namespace.ISO_V2_MSG_DEF,
         )
 
-
-# Tom added 证书更新
-class CertificateUpdate(StateEVCC):
-    """
-    The ISO 15118-2 state in which the EVCC processes a
-    PaymentServiceSelectionRes from the SECC.
-    """
-
-    def __init__(self, comm_session: EVCCCommunicationSession):
-        super().__init__(comm_session, Timeouts.CERTIFICATE_UPDATE_REQ)
-
-    async def process_message(
-        self,
-        message: Union[
-            SupportedAppProtocolReq,
-            SupportedAppProtocolRes,
-            V2GMessageV2,
-            V2GMessageV20,
-            V2GMessageDINSPEC,
-        ],
-        message_exi: bytes = None,
-    ):
-        msg = self.check_msg_v2(message, CertificateUpdateRes)
-        if not msg:
-            return
-
-        cert_update_res: CertificateUpdateRes = (
-            msg.body.certificate_update_res
-        )
-
-        if not verify_signature(
-            signature=msg.header.signature,
-            elements_to_sign=[
-                (
-                    cert_update_res.contract_cert_chain.id,
-                    EXI().to_exi(
-                        cert_update_res.contract_cert_chain, Namespace.ISO_V2_MSG_DEF
-                    ),
-                ),
-                (
-                    cert_update_res.encrypted_private_key.id,
-                    EXI().to_exi(
-                        cert_update_res.encrypted_private_key, Namespace.ISO_V2_MSG_DEF
-                    ),
-                ),
-                (
-                    cert_update_res.dh_public_key.id,
-                    EXI().to_exi(
-                        cert_update_res.dh_public_key, Namespace.ISO_V2_MSG_DEF
-                    ),
-                ),
-                (
-                    cert_update_res.emaid.id,
-                    EXI().to_exi(cert_update_res.emaid, Namespace.ISO_V2_MSG_DEF),
-                ),
-            ],
-            leaf_cert=cert_update_res.cps_cert_chain.certificate,
-            sub_ca_certs=cert_update_res.cps_cert_chain.sub_certificates.certificates,
-            root_ca_cert=load_cert(CertPath.V2G_ROOT_DER),
-        ):
-            self.stop_state_machine(
-                "Signature verification of " "CertificateUpdateRes failed"
-            )
-            return
-
-        try:
-            decrypted_priv_key = decrypt_priv_key(
-                encrypted_priv_key_with_iv=cert_update_res.encrypted_private_key.value,
-                ecdh_priv_key=load_priv_key(
-                    KeyPath.OEM_LEAF_PEM,
-                    KeyEncoding.PEM,
-                    KeyPasswordPath.OEM_LEAF_KEY_PASSWORD,
-                ),
-                ecdh_pub_key=to_ec_pub_key(cert_update_res.dh_public_key.value),
-            )
-
-            await self.comm_session.ev_controller.store_contract_cert_and_priv_key(
-                cert_update_res.contract_cert_chain.certificate, decrypted_priv_key
-            )
-        except DecryptionError:
-            self.stop_state_machine(
-                "Can't decrypt encrypted private key for contract " "certificate"
-            )
-            return
-        except PrivateKeyReadError as exc:
-            self.stop_state_machine(
-                "Can't read private key needed to decrypt "
-                "encrypted private key contained in "
-                f"CertificateInstallationRes. {exc}"
-            )
-            return
-
-        emaid = get_cert_cn(load_cert(CertPath.CONTRACT_LEAF_DER))
-
-        payment_details_req = PaymentDetailsReq(
-            emaid=emaid,
-            cert_chain=load_cert_chain(
-                protocol=Protocol.ISO_15118_2,
-                leaf_path=CertPath.CONTRACT_LEAF_DER,
-                sub_ca2_path=CertPath.MO_SUB_CA2_DER,
-                sub_ca1_path=CertPath.MO_SUB_CA1_DER,
-            ),
-        )
-
-        self.create_next_message(
-            PaymentDetails,
-            payment_details_req,
-            Timeouts.PAYMENT_DETAILS_REQ,
-            Namespace.ISO_V2_MSG_DEF,
-        )
 
 class PaymentDetails(StateEVCC):
     """
@@ -1589,75 +1389,26 @@ class CurrentDemand(StateEVCC):
         current_demand_res: CurrentDemandRes = msg.body.current_demand_res
         dc_evse_status: DCEVSEStatus = current_demand_res.dc_evse_status
 
-        #Added by Tom to deal with MeteringReceiptReq or RE_NEGOTIATION
-        if await self.comm_session.ev_controller.continue_charging():
+        if dc_evse_status.evse_notification == EVSENotification.STOP_CHARGING:
+            await self.stop_charging()
 
-            if current_demand_res.receipt_required and self.comm_session.is_tls:
-                logger.debug("SECC requested MeteringReceipt")
+        elif await self.comm_session.ev_controller.continue_charging():
+            try:
+                delay: int = (
+                    await self.comm_session.ev_controller.charge_loop_delay()
+                )  # noqa
+                logger.info(f"Next ChargeLoop Req in {delay} seconds")
+                await asyncio.sleep(delay)
+            except Exception as e:
+                logger.info(f"No delay for the next ChargeLoop Req. Reason {e}")
+            current_demand_req = await self.build_current_demand_data()
 
-                metering_receipt_req = MeteringReceiptReq(
-                    id="id1",
-                    session_id=self.comm_session.session_id,
-                    sa_schedule_tuple_id=current_demand_res.sa_schedule_tuple_id,
-                    meter_info=current_demand_res.meter_info,
-                )
-
-                try:
-                    signature = create_signature(
-                        [
-                            (
-                                metering_receipt_req.id,
-                                EXI().to_exi(
-                                    metering_receipt_req, Namespace.ISO_V2_MSG_DEF
-                                ),
-                            )
-                        ],
-                        load_priv_key(
-                            KeyPath.CONTRACT_LEAF_PEM,
-                            KeyEncoding.PEM,
-                            KeyPasswordPath.CONTRACT_LEAF_KEY_PASSWORD,
-                        ),
-                    )
-
-                    self.create_next_message(
-                        MeteringReceipt,
-                        metering_receipt_req,
-                        Timeouts.METERING_RECEIPT_REQ,
-                        Namespace.ISO_V2_MSG_DEF,
-                        signature=signature,
-                    )
-                except PrivateKeyReadError as exc:
-                    self.stop_state_machine(
-                        "Can't read private key necessary to sign "
-                        f"MeteringReceiptReq: {exc}"
-                    )
-                    return
-            elif dc_evse_status.evse_notification == EVSENotification.RE_NEGOTIATION:
-                self.comm_session.renegotiation_requested = True
-                power_delivery_req = PowerDeliveryReq(
-                    charge_progress=ChargeProgress.RENEGOTIATE,
-                    sa_schedule_tuple_id=self.comm_session.selected_schedule,
-                )
-                self.create_next_message(
-                    PowerDelivery,
-                    power_delivery_req,
-                    Timeouts.POWER_DELIVERY_REQ,
-                    Namespace.ISO_V2_MSG_DEF,
-                )
-                logger.debug(f"ChargeProgress is set to {ChargeProgress.RENEGOTIATE}")
-            elif dc_evse_status.evse_notification == EVSENotification.STOP_CHARGING:
-                await self.stop_charging()
-
-            else:
-                current_demand_req = await self.build_current_demand_data()
-
-                self.create_next_message(
-                    CurrentDemand,
-                    current_demand_req,
-                    #Timeouts.POWER_DELIVERY_REQ,
-                    Timeouts.CURRENT_DEMAND_REQ,  # modified by Tom, only  250ms
-                    Namespace.ISO_V2_MSG_DEF,
-                )
+            self.create_next_message(
+                CurrentDemand,
+                current_demand_req,
+                Timeouts.POWER_DELIVERY_REQ,
+                Namespace.ISO_V2_MSG_DEF,
+            )
         else:
             await self.stop_charging()
 

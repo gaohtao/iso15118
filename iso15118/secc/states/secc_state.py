@@ -27,7 +27,9 @@ from iso15118.shared.messages.iso15118_2.body import BodyBase as BodyBaseV2
 from iso15118.shared.messages.iso15118_2.body import (
     SessionSetupReq as SessionSetupReqV2,
 )
-from iso15118.shared.messages.iso15118_2.body import get_msg_type
+from iso15118.shared.messages.iso15118_2.body import (
+    get_msg_type,
+)
 from iso15118.shared.messages.iso15118_2.datatypes import ResponseCode as ResponseCodeV2
 from iso15118.shared.messages.iso15118_2.msgdef import V2GMessage as V2GMessageV2
 from iso15118.shared.messages.iso15118_20.common_messages import (
@@ -68,9 +70,9 @@ class StateSECC(State, ABC):
     # The response code can be set by various methods on which a State's
     # process_message() method might rely on, such as is_message_valid().
     # The default response code 'OK' can be overwritten as needed.
-    response_code: Union[
-        ResponseCodeDINSPEC, ResponseCodeV2, ResponseCodeV20
-    ] = ResponseCodeV2.OK
+    response_code: Union[ResponseCodeDINSPEC, ResponseCodeV2, ResponseCodeV20] = (
+        ResponseCodeV2.OK
+    )
 
     def __init__(
         self, comm_session: "SECCCommunicationSession", timeout: Union[float, int] = 0

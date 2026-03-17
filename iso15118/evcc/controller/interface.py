@@ -52,7 +52,10 @@ from iso15118.shared.messages.iso15118_20.common_messages import (
     SelectedEnergyService,
     SelectedVAS,
 )
-from iso15118.shared.messages.iso15118_20.common_types import RationalNumber
+from iso15118.shared.messages.iso15118_20.common_types import (
+    DisplayParameters,
+    RationalNumber,
+)
 from iso15118.shared.messages.iso15118_20.dc import (
     BPTDCChargeParameterDiscoveryReqParams,
     BPTDynamicDCChargeLoopReqParams,
@@ -74,6 +77,22 @@ class EVControllerInterface(ABC):
     # ============================================================================
     # |             COMMON FUNCTIONS (FOR ALL ENERGY TRANSFER MODES)             |
     # ============================================================================
+    @abstractmethod
+    async def charge_loop_delay(self) -> int:
+        """
+        Delays the charging loop for a certain amount of time. This could be used
+        for example to simulate a delay in the charging process, e.g. due to a
+        temporary lack of power.
+
+        Returns:
+            The amount of time the charging loop was delayed in seconds
+
+        Relevant for:
+        - DIN SPEC 70121
+        - ISO 15118-2
+        - ISO 15118-20
+        """
+        raise NotImplementedError
 
     @abstractmethod
     async def get_evcc_id(self, protocol: Protocol, iface: str) -> str:
@@ -659,3 +678,23 @@ class EVControllerInterface(ABC):
         - DIN SPEC 70121
         """
         raise NotImplementedError
+
+    @abstractmethod
+    async def enable_charging(self, enabled: bool) -> None:
+        """
+        Enables charging for the EVCC.
+        Can be used as an indication to go to state C
+        Relevant for:
+        - DIN SPEC 70121
+        - ISO 15118-2
+        - ISO 15118-20
+        """
+
+    @abstractmethod
+    async def get_display_params(self) -> DisplayParameters:
+        """
+        Enables charging for the EVCC.
+        Can be used as an indication to go to state C
+        Relevant for:
+        - ISO 15118-20
+        """
