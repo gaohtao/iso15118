@@ -290,6 +290,24 @@ class EVControllerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def is_cert_update_needed(self) -> bool:
+        """
+        Returns True if the update of a contract certificate is needed, False
+        otherwise. A certificate installation is needed if the authorization option
+        'Contract' (Plug & Charge) is chosen but no valid contract certificate is
+        currently installed. An EV manufacturer might also choose to use the
+        certificate update process instead of a certificate update process
+        available in ISO 15118-2 as there's no benefit of using the
+        CertificateUpdateReq instead of the CertificateupdateReq message.
+        For example, you might want to choose to do a contract certificate
+        update if a certificate is about to expire (e.g. in two weeks).
+
+        Relevant for:
+        - ISO 15118-2
+        - ISO 15118-20
+        """
+        raise NotImplementedError
+    @abstractmethod
     async def process_sa_schedules_dinspec(
         self, sa_schedules: List[SAScheduleTupleEntryDINSPEC]
     ) -> int:

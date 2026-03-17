@@ -32,6 +32,7 @@ class EVCCConfig(BaseModel):
     )
     supported_energy_services: List[ServiceV20] = None
     is_cert_install_needed: bool = Field(False, alias="isCertInstallNeeded")
+    is_cert_update_needed: bool = Field(False, alias="isCertUpdateNeeded")
     # Indicates the security level (either TCP (unencrypted) or TLS (encrypted))
     # the EVCC shall send in the SDP request
     use_tls: Optional[bool] = Field(True, alias="useTls")
