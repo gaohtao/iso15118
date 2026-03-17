@@ -3,6 +3,7 @@ This module contains the SECC's States used to process the EVCC's incoming
 V2GMessage objects of the ISO 15118-2 protocol, from SessionSetupReq to
 SessionStopReq.
 """
+
 import asyncio
 import base64
 import logging
@@ -10,7 +11,8 @@ import time
 from typing import List, Optional, Tuple, Type, Union
 
 from iso15118.secc.comm_session_handler import SECCCommunicationSession
-from iso15118.secc.controller.ev_data import EVChargeParamsLimits, EVSessionContext15118
+from iso15118.secc.controller.ev_data import EVSessionContext15118
+from iso15118.secc.controller.evse_data import CurrentType
 from iso15118.secc.controller.interface import AuthorizationResponse
 from iso15118.secc.states.secc_state import StateSECC
 from iso15118.shared.exceptions import (
@@ -31,10 +33,6 @@ from iso15118.shared.messages.app_protocol import (
 from iso15118.shared.messages.datatypes import (
     DCEVSEChargeParameter,
     DCEVSEStatus,
-    PVEVMaxCurrent,
-    PVEVMaxCurrentLimit,
-    PVEVMaxVoltage,
-    PVEVMaxVoltageLimit,
     PVEVSEPresentCurrent,
 )
 from iso15118.shared.messages.din_spec.datatypes import (
@@ -62,6 +60,8 @@ from iso15118.shared.messages.iso15118_2.body import (
     CableCheckRes,
     CertificateInstallationReq,
     CertificateInstallationRes,
+    CertificateUpdateReq,
+    CertificateUpdateRes,
     ChargeParameterDiscoveryReq,
     ChargeParameterDiscoveryRes,
     ChargingStatusReq,
@@ -193,7 +193,7 @@ class SessionSetup(StateSECC):
             and msg.header.session_id == self.comm_session.ev_session_context.session_id
         ):
             # The EV wants to resume the previously paused charging session
-            session_id = self.comm_session.session_id
+            session_id = self.comm_session.ev_session_context.session_id
             self.response_code = ResponseCode.OK_OLD_SESSION_JOINED
         else:
             # False session ID from EV, gracefully assigning new session ID
@@ -523,6 +523,7 @@ class PaymentServiceSelection(StateSECC):
     2. a CertificateInstallationReq (not the update, as we don't offer this)
     3. a PaymentDetailsReq
     4. an AuthorizationReq
+    5. a CertificateUpdateReq
 
     Upon first initialisation of this state, we expect a
     PaymentServiceSelectionReq, but after that, the next possible request could
@@ -555,6 +556,7 @@ class PaymentServiceSelection(StateSECC):
             [
                 PaymentServiceSelectionReq,
                 CertificateInstallationReq,
+                CertificateUpdateReq,
                 PaymentDetailsReq,
                 AuthorizationReq,
             ],
@@ -565,6 +567,12 @@ class PaymentServiceSelection(StateSECC):
 
         if msg.body.certificate_installation_req:
             await CertificateInstallation(self.comm_session).process_message(
+                message, message_exi
+            )
+            return
+        
+        if msg.body.certificate_update_req:
+            await CertificateUpdate(self.comm_session).process_message(
                 message, message_exi
             )
             return
@@ -895,6 +903,264 @@ class CertificateInstallation(StateSECC):
 
         return cert_install_res, signature
 
+class CertificateUpdate(StateSECC):
+    """
+    The ISO 15118-2 state in which the SECC processes a
+    CertificateUpdateReq message from the EVCC.
+    """
+
+    def __init__(self, comm_session: SECCCommunicationSession):
+        super().__init__(comm_session, Timeouts.V2G_SECC_SEQUENCE_TIMEOUT)
+
+    async def process_message(
+        self,
+        message: Union[
+            SupportedAppProtocolReq,
+            SupportedAppProtocolRes,
+            V2GMessageV2,
+            V2GMessageV20,
+            V2GMessageDINSPEC,
+        ],
+        message_exi: bytes = None,
+    ):
+        msg = self.check_msg_v2(message, [CertificateUpdateReq])
+        if not msg:
+            return
+
+        if not self.validate_message_signature(msg):
+            logger.info("CertificateUpdate:  0001")
+            self.stop_state_machine(
+                "Signature verification failed for CertificateUpdateReq",
+                message,
+                ResponseCode.FAILED_SIGNATURE_ERROR
+            )
+            return
+
+        # In a real world scenario we need to fetch the certificate from the backend.
+        # We call get_15118_ev_certificate method, which would be a direct mapping
+        # to the Get15118EVCertificateRequest
+        # message from OCPP 2.0.1 for the installation case.
+        # This accepts 2 arguments:
+        # 1. The raw EXI CertificateUpdateReq message coming from the EV
+        # in base64 encoded form.
+        # 2. A string that specifies `15118SchemaVersion` which would be either of
+        # "urn:iso:15118:2:2013:MsgDef" or "urn:iso:std:iso:15118:-20:CommonMessages"
+        signature = None
+
+        try:
+            if self.comm_session.config.use_cpo_backend:
+                logger.info("Using CPO backend to fetch CertificateUpdateRes")
+                # CertificateUpdateReq must be base64 encoded before forwarding to backend.
+                # Call to b64encode returns byte[] - hence the .decode("utf-8")
+                base64_certificate_update_req = base64.b64encode(message_exi).decode(
+                    "utf-8"
+                )
+
+                # The response received below is EXI response in base64 encoded form.
+                # Decoding to EXI happens later just before V2GTP packet is built.
+                base64_certificate_update_res = (
+                    await self.comm_session.evse_controller.get_15118_ev_certificate(
+                        base64_certificate_update_req, Namespace.ISO_V2_MSG_DEF
+                    )
+                )
+                certificate_update_res: Union[
+                    CertificateUpdateRes, Base64
+                ] = Base64(
+                    message=base64_certificate_update_res,
+                    message_name=CertificateUpdateRes.__name__,
+                    namespace=Namespace.ISO_V2_MSG_DEF,
+                )
+            else:
+                (
+                    certificate_update_res,
+                    signature,
+                ) = self.generate_certificate_update_res()
+                logger.info("CertificateUpdate:  2222")
+
+        except Exception as e:
+            error = f"Error building CertificateUpdateRes: {e}"
+            logger.error(error)
+            self.stop_state_machine(
+                error,
+                message,
+                ResponseCode.FAILED_NO_CERTIFICATE_AVAILABLE,
+            )
+            return
+        logger.info("CertificateUpdate:  3333")
+        self.create_next_message(
+            PaymentDetails,
+            certificate_update_res,
+            Timeouts.V2G_SECC_SEQUENCE_TIMEOUT,
+            Namespace.ISO_V2_MSG_DEF,
+            signature=signature,
+        )
+
+    #用请求中的合同证书公钥进行验证签名
+    def validate_message_signature(self, message: V2GMessageV2) -> bool:
+        # For the CertificateUpdate, the min. the SECC can do is
+        # to verify the message signature, using the OEM provisioning
+        # certificate (public key) - this is available in the cert update req.
+        # The chain of signatures, from the signature in the
+        # CertificateUpdateReq's header all the way to the
+        # self-signed OEM/V2G root certificate, can be verified if the
+        # OEM Sub-CA and OEM/V2G root CA certificate are available.
+
+        cert_update_req: CertificateUpdateReq = (
+            message.body.certificate_update_req
+        )
+
+        sub_ca_certificates_mo = None
+        root_ca_certificate_mo = None
+
+        try:
+            sub_ca_certificates_mo = [
+                load_cert(CertPath.MO_SUB_CA2_DER),
+                load_cert(CertPath.MO_SUB_CA1_DER),
+            ]
+            root_ca_certificate_mo = load_cert(CertPath.MO_ROOT_DER)
+        except (FileNotFoundError, IOError):
+            pass
+
+        return verify_signature(
+            signature=message.header.signature,
+            elements_to_sign=[
+                (
+                    cert_update_req.id,
+                    EXI().to_exi(cert_update_req, Namespace.ISO_V2_MSG_DEF),
+                )
+            ],
+            # leaf_cert=cert_update_req.contract_cert_chain.certificate,
+            leaf_cert= load_cert(CertPath.CONTRACT_LEAF_DER),
+            sub_ca_certs=sub_ca_certificates_mo,
+            root_ca_cert=root_ca_certificate_mo,
+        )
+
+    #组装应答包，需要进行签名
+    def generate_certificate_update_res(
+        self,
+    ) -> Tuple[CertificateUpdateRes, Signature]:
+        # Here we create the CertificateUpdateRes message ourselves as we
+        # have access to all certificates and private keys needed.
+        # This is however not the real production case.
+        # Note: the Raw EXI encoded message that includes the Header and the Body of the
+        # CertificateInstallationReq must be used.
+
+        try:
+            dh_pub_key, encrypted_priv_key_bytes = encrypt_priv_key(
+                oem_prov_cert=load_cert(CertPath.OEM_LEAF_DER),
+                priv_key_to_encrypt=load_priv_key(
+                    KeyPath.CONTRACT_LEAF_PEM,
+                    KeyEncoding.PEM,
+                    KeyPasswordPath.CONTRACT_LEAF_KEY_PASSWORD,
+                ),
+            )
+        except EncryptionError:
+            raise EncryptionError(
+                "EncryptionError while trying to encrypt the "
+                "private key for the contract certificate"
+            )
+        except PrivateKeyReadError as exc:
+            raise PrivateKeyReadError(
+                f"Can't read private key to encrypt for "
+                f"CertificateInstallationRes: {exc}"
+            )
+
+        # The elements that need to be part of the signature
+        cps_certificate_chain = CertificateChain(
+            certificate=load_cert(CertPath.CPS_LEAF_DER),
+            sub_certificates=SubCertificates(
+                certificates=[
+                    load_cert(CertPath.CPS_SUB_CA2_DER),
+                    load_cert(CertPath.CPS_SUB_CA1_DER),
+                ]
+            ),
+        )
+        contract_cert_chain = CertificateChain(
+            id="id1",
+            certificate=load_cert(CertPath.CONTRACT_LEAF_DER),
+            sub_certificates=SubCertificates(
+                certificates=[
+                    load_cert(CertPath.MO_SUB_CA2_DER),
+                    load_cert(CertPath.MO_SUB_CA1_DER),
+                ]
+            ),
+        )
+        encrypted_priv_key = EncryptedPrivateKey(
+            id="id2", value=encrypted_priv_key_bytes
+        )
+        dh_public_key = DHPublicKey(id="id3", value=dh_pub_key)
+        emaid = EMAID(
+            id="id4", value=get_cert_cn(load_cert(CertPath.CONTRACT_LEAF_DER))
+        )
+
+        #重试次数默认不填，只有当应答失败时才填写
+        # RetryCounter 仅在以下响应码（ResponseCode）出现时才会包含：
+        # * FAILED_NoCertificateAvailable    无可用证书（可能是证书库存不足）
+        # * FAILED_ContractCanceled           合同已取消（用户终止了合同）
+        #取值       含义               解释
+        # x > 0       等待 x 天后重试    EVCC 应在指定天数后再次尝试证书更新
+        # 0           立即重试           在下次充电时立即尝试更新证书
+        # -1       永不重试           永久停止证书更新尝试
+
+        retry_counter = None
+        cert_update_res = CertificateUpdateRes(
+            response_code=ResponseCode.OK,
+            cps_cert_chain=cps_certificate_chain,
+            contract_cert_chain=contract_cert_chain,
+            encrypted_private_key=encrypted_priv_key,
+            dh_public_key=dh_public_key,
+            emaid=emaid,
+            retry_counter=retry_counter
+        )
+
+        try:
+            # Elements to sign, containing its id and the exi encoded stream
+            contract_cert_tuple = (
+                cert_update_res.contract_cert_chain.id,
+                EXI().to_exi(
+                    cert_update_res.contract_cert_chain, Namespace.ISO_V2_MSG_DEF
+                ),
+            )
+            encrypted_priv_key_tuple = (
+                cert_update_res.encrypted_private_key.id,
+                EXI().to_exi(
+                    cert_update_res.encrypted_private_key, Namespace.ISO_V2_MSG_DEF
+                ),
+            )
+            dh_public_key_tuple = (
+                cert_update_res.dh_public_key.id,
+                EXI().to_exi(cert_update_res.dh_public_key, Namespace.ISO_V2_MSG_DEF),
+            )
+            emaid_tuple = (
+                cert_update_res.emaid.id,
+                EXI().to_exi(cert_update_res.emaid, Namespace.ISO_V2_MSG_DEF),
+            )
+
+            elements_to_sign = [
+                contract_cert_tuple,
+                encrypted_priv_key_tuple,
+                dh_public_key_tuple,
+                emaid_tuple,
+            ]
+            # The private key to be used for the signature
+            signature_key = load_priv_key(
+                KeyPath.CPS_LEAF_PEM,
+                KeyEncoding.PEM,
+                KeyPasswordPath.CPS_LEAF_KEY_PASSWORD,
+            )
+
+            signature = create_signature(elements_to_sign, signature_key)
+
+        except PrivateKeyReadError as exc:
+            raise PrivateKeyReadError(
+                "Can't read private key needed to create signature "
+                f"for CertificateUpdateRes: {exc}",
+                ResponseCode.FAILED,
+            )
+
+        return cert_update_res, signature
+
+
 
 class PaymentDetails(StateSECC):
     """
@@ -922,7 +1188,7 @@ class PaymentDetails(StateSECC):
     def __init__(self, comm_session: SECCCommunicationSession):
         super().__init__(comm_session, Timeouts.V2G_SECC_SEQUENCE_TIMEOUT)
 
-    def _mobility_operator_root_cert_path(self) -> str:
+    def _mobility_operator_root_cert_path(self) -> Optional[str]:
         """Return the path to the MO root.  Included to be patched in tests."""
         return CertPath.MO_ROOT_DER
 
@@ -959,10 +1225,29 @@ class PaymentDetails(StateSECC):
             #      to the PKI that is used.
             root_cert_path = self._mobility_operator_root_cert_path()
             try:
-                root_cert = load_cert(root_cert_path)
-                verify_certs(leaf_cert, sub_ca_certs, root_cert)
+                if root_cert_path:
+                    root_cert = load_cert(root_cert_path)
+                    logger.info(f"Using MO root at {root_cert_path}")
+                else:
+                    root_cert = None
+                    logger.info("No suitable MO root found.")
             except FileNotFoundError:
-                logger.warning(f"MO Root Cert cannot be found {root_cert_path}")
+                logger.warning("MO Root Cert not available.")
+                root_cert = None
+
+            try:
+                verify_certs(leaf_cert, sub_ca_certs, root_cert)
+            except CertSignatureError:
+                # This error means there was an error while validating the parent-child
+                # relationship in the cert chain. This could also very well be
+                # a limitation on the SECC that the root certificate present
+                # doesn't match the chain passed through.
+                # So set root_cert to None and pass the incoming chain to the backend
+                # for further checks.
+                logger.info(
+                    "Local chain verification failed. "
+                    "Passing verification to backend."
+                )
                 root_cert = None
 
             # Note that the eMAID format (14 or 15 characters) will be validated
@@ -1333,14 +1618,17 @@ class ChargeParameterDiscovery(StateSECC):
             )
             return
 
-        self.comm_session.selected_energy_mode = charge_params_req.requested_energy_mode
+        evse_data_context = self.comm_session.evse_controller.evse_data_context
+        ev_data_context = self.comm_session.evse_controller.ev_data_context
+
+        ev_data_context.selected_energy_mode = charge_params_req.requested_energy_mode
         self.comm_session.selected_charging_type_is_ac = (
-            self.comm_session.selected_energy_mode.value.startswith("AC")
+            ev_data_context.selected_energy_mode.value.startswith("AC")
         )
 
-        max_schedule_entries: Optional[
-            int
-        ] = charge_params_req.max_entries_sa_schedule_tuple
+        max_schedule_entries: Optional[int] = (
+            charge_params_req.max_entries_sa_schedule_tuple
+        )
 
         ac_evse_charge_params: Optional[ACEVSEChargeParameter] = None
         dc_evse_charge_params: Optional[DCEVSEChargeParameter] = None
@@ -1348,51 +1636,27 @@ class ChargeParameterDiscovery(StateSECC):
             ac_evse_charge_params = (
                 await self.comm_session.evse_controller.get_ac_charge_params_v2()
             )
-            ev_max_voltage: Union[
-                PVEVMaxVoltageLimit, PVEVMaxVoltage
-            ] = charge_params_req.ac_ev_charge_parameter.ev_max_voltage
-            ev_max_current: Union[
-                PVEVMaxCurrentLimit, PVEVMaxCurrent
-            ] = charge_params_req.ac_ev_charge_parameter.ev_max_current
-            e_amount = charge_params_req.ac_ev_charge_parameter.e_amount
-            ev_charge_params_limits = EVChargeParamsLimits(
-                ev_max_voltage=ev_max_voltage,
-                ev_max_current=ev_max_current,
-                e_amount=e_amount,
+            evse_data_context.current_type = CurrentType.AC
+            # Update EV data context with the DC charge parameters
+            ev_data_context.update_ac_charge_parameters_v2(
+                charge_params_req.ac_ev_charge_parameter
             )
-            departure_time = charge_params_req.ac_ev_charge_parameter.departure_time
         else:
             dc_evse_charge_params = (
-                await self.comm_session.evse_controller.get_dc_evse_charge_parameter()
+                await self.comm_session.evse_controller.get_dc_charge_parameters_v2()
             )
-            ev_max_voltage = (
-                charge_params_req.dc_ev_charge_parameter.ev_maximum_voltage_limit
+            evse_data_context.current_type = CurrentType.DC
+            # Update EV data context with the DC charge parameters
+            ev_data_context.update_dc_charge_parameters(
+                charge_params_req.dc_ev_charge_parameter
             )
-            ev_max_current = (
-                charge_params_req.dc_ev_charge_parameter.ev_maximum_current_limit
-            )
-            ev_energy_request = (
-                charge_params_req.dc_ev_charge_parameter.ev_energy_request
-            )
-            ev_max_power = (
-                charge_params_req.dc_ev_charge_parameter.ev_maximum_power_limit
-            )
-            ev_charge_params_limits = EVChargeParamsLimits(
-                ev_max_voltage=ev_max_voltage,
-                ev_max_current=ev_max_current,
-                ev_max_power=ev_max_power,
-                ev_energy_request=ev_energy_request,
-            )
-            departure_time = charge_params_req.dc_ev_charge_parameter.departure_time
+        await self.comm_session.evse_controller.send_rated_limits()
 
-        self.comm_session.evse_controller.ev_charge_params_limits = (
-            ev_charge_params_limits
+        departure_time = (
+            ev_data_context.departure_time if ev_data_context.departure_time else 0
         )
-
-        if not departure_time:
-            departure_time = 0
         sa_schedule_list = await self.comm_session.evse_controller.get_sa_schedule_list(
-            ev_charge_params_limits,
+            ev_data_context,
             self.comm_session.config.free_charging_service,
             max_schedule_entries,
             departure_time,
@@ -1478,9 +1742,9 @@ class ChargeParameterDiscovery(StateSECC):
 
         charge_params_res = ChargeParameterDiscoveryRes(
             response_code=ResponseCode.OK,
-            evse_processing=EVSEProcessing.FINISHED
-            if sa_schedule_list
-            else EVSEProcessing.ONGOING,
+            evse_processing=(
+                EVSEProcessing.FINISHED if sa_schedule_list else EVSEProcessing.ONGOING
+            ),
             sa_schedule_list=SAScheduleList(schedule_tuples=sa_schedule_list),
             ac_charge_parameter=ac_evse_charge_params,
             dc_charge_parameter=dc_evse_charge_params,
@@ -1634,6 +1898,11 @@ class PowerDelivery(StateSECC):
                 ResponseCode.FAILED_TARIFF_SELECTION_INVALID,
             )
             return
+
+        if power_delivery_req.dc_ev_power_delivery_parameter:
+            self.comm_session.evse_controller.ev_data_context.present_soc = (
+                power_delivery_req.dc_ev_power_delivery_parameter.dc_ev_status.ev_ress_soc  # noqa
+            )
 
         # TODO: Investigate this and reassess
         # if (
@@ -1997,7 +2266,7 @@ class MeteringReceipt(StateSECC):
 
         evse_controller = self.comm_session.evse_controller
         if (
-            self.comm_session.selected_energy_mode
+            evse_controller.ev_data_context.selected_energy_mode
             and self.comm_session.selected_charging_type_is_ac
         ):
             metering_receipt_res = MeteringReceiptRes(
@@ -2188,7 +2457,8 @@ class CableCheck(StateSECC):
 
     def __init__(self, comm_session: SECCCommunicationSession):
         super().__init__(comm_session, Timeouts.V2G_SECC_SEQUENCE_TIMEOUT)
-        self.cable_check_req_was_received = False
+        self.cable_check_started = False
+        self.contactors_closed = False
 
     async def process_message(
         self,
@@ -2216,52 +2486,64 @@ class CableCheck(StateSECC):
             )
             return
 
-        if not self.cable_check_req_was_received:
-            # First CableCheckReq received. Start cable check.
-            await self.comm_session.evse_controller.start_cable_check()
+        next_state = None
+        evse_processing = EVSEProcessing.ONGOING
 
-            # Requirement in 6.4.3.106 of the IEC 61851-23
-            # Any relays in the DC output circuit of the DC station shall
-            # be closed during the insulation test
-            if not await self.comm_session.evse_controller.is_contactor_closed():
+        if not self.cable_check_started:
+            await self.comm_session.evse_controller.start_cable_check()
+            self.cable_check_started = True
+
+        if self.contactors_closed:
+            isolation_level = (
+                await self.comm_session.evse_controller.get_cable_check_status()
+            )  # noqa
+
+            evse_processing = EVSEProcessing.ONGOING
+            next_state = None
+            if isolation_level in [
+                IsolationLevel.VALID,
+                IsolationLevel.WARNING,
+            ]:
+                if isolation_level == IsolationLevel.WARNING:
+                    logger.warning(
+                        "Isolation resistance measured by EVSE is in Warning-Range"
+                    )
+                evse_processing = EVSEProcessing.FINISHED
+                next_state = PreCharge
+            elif isolation_level in [
+                IsolationLevel.FAULT,
+                IsolationLevel.NO_IMD,
+                IsolationLevel.INVALID,
+            ]:
                 self.stop_state_machine(
-                    "Contactor didnt close for Cable Check",
+                    f"Isolation Failure: {isolation_level}",
                     message,
                     ResponseCode.FAILED,
                 )
                 return
+        else:
+            # Requirement in 6.4.3.106 of the IEC 61851-23
+            # Any relays in the DC output circuit of the DC station shall
+            # be closed during the insulation test
+            # If None is returned, then contactor close operation is ongoing.
+            contactors_closed_for_cable_check = (
+                await self.comm_session.evse_controller.is_contactor_closed()
+            )
 
-            self.cable_check_req_was_received = True
-        self.comm_session.evse_controller.ev_data_context.ev_session_context.soc = (
+            if contactors_closed_for_cable_check is not None:
+                if contactors_closed_for_cable_check:
+                    self.contactors_closed = True
+                else:
+                    self.stop_state_machine(
+                        "Contactor didnt close for Cable Check",
+                        message,
+                        ResponseCode.FAILED,
+                    )
+                    return
+
+        self.comm_session.evse_controller.ev_data_context.present_soc = (
             cable_check_req.dc_ev_status.ev_ress_soc
         )
-
-        isolation_level = (
-            await self.comm_session.evse_controller.get_cable_check_status()
-        )  # noqa
-
-        evse_processing = EVSEProcessing.ONGOING
-        next_state = None
-        if isolation_level in [
-            IsolationLevel.VALID,
-            IsolationLevel.WARNING,
-        ]:
-            if isolation_level == IsolationLevel.WARNING:
-                logger.warning(
-                    "Isolation resistance measured by EVSE is in Warning-Range"
-                )
-            evse_processing = EVSEProcessing.FINISHED
-            next_state = PreCharge
-        elif isolation_level in [
-            IsolationLevel.FAULT,
-            IsolationLevel.NO_IMD,
-        ]:
-            self.stop_state_machine(
-                f"Isolation Failure: {isolation_level}",
-                message,
-                ResponseCode.FAILED,
-            )
-            return
 
         cable_check_res = CableCheckRes(
             response_code=ResponseCode.OK,
@@ -2325,11 +2607,8 @@ class PreCharge(StateSECC):
                 ResponseCode.FAILED,
             )
             return
-
-        self.comm_session.evse_controller.ev_data_context.ev_session_context.soc = (
-            precharge_req.dc_ev_status.ev_ress_soc
-        )
-
+        ev_data_context = self.comm_session.evse_controller.ev_data_context
+        ev_data_context.update_pre_charge_parameters(precharge_req)
         # for the PreCharge phase, the requested current must be < 2 A
         # (maximum inrush current according to CC.5.2 in IEC61851 -23)
         present_current = (
@@ -2338,15 +2617,16 @@ class PreCharge(StateSECC):
             )
         )
         if isinstance(present_current, PVEVSEPresentCurrent):
-            present_current_in_a = (
-                present_current.value * 10**present_current.multiplier
-            )
-            target_current = precharge_req.ev_target_current
-            target_current_in_a = target_current.value * 10**target_current.multiplier
+            present_current_in_a = present_current.get_decimal_value()
+            target_current_in_a = ev_data_context.target_current
         else:
-            present_current_in_a = present_current.value
-            target_current = precharge_req.ev_target_current
-            target_current_in_a = target_current.value
+            self.stop_state_machine(
+                "Error reading EVSE Present Current."
+                f"Wrong type: {type(present_current)}",
+                message,
+                ResponseCode.FAILED,
+            )
+            return
 
         if present_current_in_a > 2 or target_current_in_a > 2:
             self.stop_state_machine(
@@ -2359,9 +2639,19 @@ class PreCharge(StateSECC):
         # Set precharge voltage in every loop.
         # Because there are EVs that send a wrong Precharge-Voltage
         # in the first message (example: BMW i3 Rex 2018)
-        await self.comm_session.evse_controller.set_precharge(
-            precharge_req.ev_target_voltage, precharge_req.ev_target_current
-        )
+        try:
+            await self.comm_session.evse_controller.send_charging_command(
+                ev_data_context.target_voltage,
+                ev_data_context.target_current,
+                is_precharge=True,
+            )
+        except asyncio.TimeoutError:
+            self.stop_state_machine(
+                "Error sending targets to charging station in charging loop.",
+                message,
+                ResponseCode.FAILED,
+            )
+            return
 
         dc_charger_state = await self.comm_session.evse_controller.get_dc_evse_status()
         evse_present_voltage = (
@@ -2422,29 +2712,24 @@ class CurrentDemand(StateSECC):
 
         current_demand_req: CurrentDemandReq = msg.body.current_demand_req
 
-        self.comm_session.evse_controller.ev_data_context.ev_session_context.soc = (
-            current_demand_req.dc_ev_status.ev_ress_soc
-        )
+        ev_data_context = self.comm_session.evse_controller.ev_data_context
+        ev_data_context.update_charge_loop_parameters(current_demand_req)
 
-        self.comm_session.evse_controller.ev_data_context.ev_session_context.remaining_time_to_bulk_soc_s = (  # noqa: E501
-            None
-            if current_demand_req.remaining_time_to_bulk_soc is None
-            else current_demand_req.remaining_time_to_bulk_soc.get_decimal_value()
-        )
+        # Updates the power electronics targets based on EV requests
+        try:
+            await self.comm_session.evse_controller.send_charging_command(
+                ev_data_context.target_voltage,
+                ev_data_context.target_current,
+            )
+        except asyncio.TimeoutError:
+            self.stop_state_machine(
+                "Error sending targets to charging station in charging loop.",
+                message,
+                ResponseCode.FAILED,
+            )
+            return
 
-        self.comm_session.evse_controller.ev_data_context.ev_session_context.remaining_time_to_full_soc_s = (  # noqa: E501
-            None
-            if current_demand_req.remaining_time_to_full_soc is None
-            else current_demand_req.remaining_time_to_full_soc.get_decimal_value()
-        )
-
-        self.comm_session.evse_controller.ev_charge_params_limits.ev_max_current = (
-            current_demand_req.ev_max_current_limit
-        )
-
-        await self.comm_session.evse_controller.send_charging_command(
-            current_demand_req.ev_target_voltage, current_demand_req.ev_target_current
-        )
+        await self.comm_session.evse_controller.send_display_params()
 
         # We don't care about signed meter values from the EVCC, but if you
         # do, then set receipt_required to True and set the field meter_info

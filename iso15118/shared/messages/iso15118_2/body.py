@@ -9,6 +9,7 @@ Pydantic's Field class is used to be able to create a json schema of each model
 (or class) that matches the definitions in the XSD schema, including the XSD
 element names by using the 'alias' attribute.
 """
+
 import logging
 from abc import ABC
 from typing import Optional, Tuple, Type
@@ -42,6 +43,7 @@ from iso15118.shared.messages.enums import (
 )
 from iso15118.shared.messages.iso15118_2.datatypes import (
     EMAID,
+    eMAID,
     ACEVChargeParameter,
     ACEVSEChargeParameter,
     ACEVSEStatus,
@@ -63,7 +65,6 @@ from iso15118.shared.messages.iso15118_2.datatypes import (
     ServiceCategory,
     ServiceList,
     ServiceParameterList,
-    eMAID,
 )
 from iso15118.shared.validators import one_field_must_be_set
 
@@ -178,7 +179,7 @@ class CertificateUpdateReq(BodyBase):
     contract_cert_chain: CertificateChain = Field(
         ..., alias="ContractSignatureCertChain"
     )
-    emaid: EMAID = Field(..., alias="eMAID")
+    emaid: eMAID = Field(..., alias="eMAID")
     list_of_root_cert_ids: RootCertificateIDList = Field(
         ..., alias="ListOfRootCertificateIDs"
     )
@@ -745,6 +746,8 @@ def get_msg_type(msg_name: str) -> Optional[Type[BodyBase]]:
         "PaymentServiceSelectionRes": PaymentServiceSelectionRes,
         "CertificateInstallationReq": CertificateInstallationReq,
         "CertificateInstallationRes": CertificateInstallationRes,
+        "CertificateUpdateReq": CertificateUpdateReq,
+        "CertificateUpdateRes": CertificateUpdateRes,
         "PaymentDetailsReq": PaymentDetailsReq,
         "PaymentDetailsRes": PaymentDetailsRes,
         "AuthorizationReq": AuthorizationReq,
